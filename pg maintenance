@@ -5,6 +5,8 @@
 > based on size + age signals to control DB growth.
 
 ---
+NOTE: KEEP MORE DISK AVAILABLE DURING THIS VACCUM AND REINDEX PHASE
+
 
 # ⚠️ IMPORTANT NOTES
 
