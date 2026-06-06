@@ -1,0 +1,57 @@
+# Bitmagnet Targeted Cleanup Strategy (Staged Torrent Pruning)
+
+> Purpose:
+> Gradual, safe removal of low-value torrents and their file metadata
+> based on size + age signals to control DB growth.
+
+---
+
+# ⚠️ IMPORTANT NOTES
+
+- These queries ONLY affect `torrent_files`
+- They rely on `torrents` metadata for selection
+- Run in order (Step 1 → Step 2 → Step 3)
+- Repeat cycles if needed for larger cleanup
+
+---
+
+# 🔴 STEP 1 — Remove worst offenders (large + stale torrents)
+
+```sql
+DELETE FROM torrent_files
+WHERE info_hash IN (
+    SELECT t.info_hash
+    FROM torrents t
+    WHERE t.files_count > 1000
+    ORDER BY t.updated_at ASC NULLS FIRST
+    LIMIT 50000
+);
+🟠 STEP 2 — Remove medium + stale torrents
+DELETE FROM torrent_files
+WHERE info_hash IN (
+    SELECT t.info_hash
+    FROM torrents t
+    WHERE t.files_count BETWEEN 200 AND 1000
+    ORDER BY t.updated_at ASC NULLS FIRST
+    LIMIT 50000
+);
+🟡 STEP 3 — Remove oldest remaining torrents
+DELETE FROM torrent_files
+WHERE info_hash IN (
+    SELECT t.info_hash
+    FROM torrents t
+    ORDER BY t.created_at ASC
+    LIMIT 50000
+);
+
+🧽 AFTER EACH STEP (IMPORTANT)
+VACUUM (ANALYZE) torrent_files;
+
+
+🧠 FINAL STEP (after all deletions)
+VACUUM FULL torrent_files;
+REINDEX TABLE torrent_files;
+
+
+
+
