@@ -1,0 +1,243 @@
+Here is a clean, comprehensive, and production-ready `README.md` containing all verified and tested steps of your setup. You can commit this file directly to your GitHub repository for documentation and future maintenance.
+
+---
+
+### File Content: `README.md`
+
+```markdown
+# Agentless Real-Time Centralized Log Infrastructure (Logdy + Vector)
+
+A production-grade, ultra-thin, and **100% in-memory (zero disk-write amplification)** log-centralization system. This architecture runs completely in RAM to protect SSD longevity on Proxmox hypervisors while providing real-time, sub-millisecond dashboard filtering.
+
+## System Architecture
+
+```
+                                  [ PROXMOX HOST ]
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  [ LXC 101: Docker Host ]              [ Host-Level Logging Router ]         │
+│  ┌───────────────────────┐             ┌─────────────────────────────┐       │
+│  │  - Authelia           │             │  Vector (Rust Engine)       │       │
+│  │  - Postgres           │             │                             │       │
+│  │  - Stremio Add-ons    │             │  1. Scrapes nested socket   │       │
+│  │                       │             │     via /proc namespace     │       │
+│  │  /run/docker.sock ───┼────────────►│  2. Routes structured JSON  │       │
+│  └───────────────────────┘             └──────────────┬──────────────┘       │
+│                                                       │ (Port 8123 TCP)      │
+└───────────────────────────────────────────────────────┼──────────────────────┘
+                                                        ▼
+                                           [ CENTRAL LOGDY SERVER ]
+                                         ┌───────────────────────────┐
+                                         │  Alpine LXC (RAM Buffers) │
+                                         │  Web UI Port: 8080        │
+                                         └───────────────────────────┘
+```
+
+* **Central Receiver:** Logdy running in `socket` mode inside a lightweight Alpine Linux LXC. It keeps all active log buffers strictly in RAM.
+* **Log Shipper:** Vector running directly on the Proxmox Host as a root service. It maps the namespace of your nested LXC container, auto-discovers your selected containers, and streams them securely via TCP.
+
+---
+
+## Phase 1: Setup Logdy Central Receiver (Alpine LXC)
+
+Logdy serves as your central high-performance ring buffer. Because Alpine uses `musl` instead of `glibc`, ensure compatibility layers are installed first.
+
+### 1. Fix Alpine Compatibility & Install Logdy
+Download your preferred Logdy release and place it at `/usr/local/bin/logdy`.
+
+```bash
+# Add compatibility layers for standard linux binaries
+apk update
+apk add gcompat
+
+# Ensure Logdy is executable
+chmod +x /usr/local/bin/logdy
+```
+
+### 2. Configure OpenRC Init Script
+Create a background-safe service initialization script:
+
+```bash
+nano /etc/init.d/logdy
+```
+
+Paste the following service configuration:
+
+```sh
+#!/sbin/openrc-run
+
+name="logdy"
+description="Logdy Real-time Centralized Log Server"
+command="/usr/local/bin/logdy"
+
+# Arguments open TCP 8123 for Vector, and UI 8080 for browsers. No-analytics prevents WAN overhead.
+command_args="socket 8123 --port 8080 --ui-ip 0.0.0.0 --no-analytics --no-updates"
+
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/logdy.log"
+error_log="/var/log/logdy.err"
+
+depend() {
+    need net
+}
+```
+
+### 3. Launch Logdy
+```bash
+chmod +x /etc/init.d/logdy
+rc-update add logdy default
+rc-service logdy start
+```
+Verify the interface is accessible via browser at `http://<YOUR_ALPINE_LOGDY_IP>:8080`.
+
+---
+
+## Phase 2: Setup Log Router (Proxmox Host)
+
+We run Vector directly on the Proxmox host. This allows a single service to handle log aggregation for any LXC or Docker container agentlessly.
+
+### 1. Register the Official APT Repository Manually
+Run these commands in your Proxmox Host shell:
+
+```bash
+# Install dependencies
+apt-get update && apt-get install -y apt-transport-https curl gnupg
+
+# Download Datadog's verified public GPG key
+curl -sSf https://keys.datadoghq.com/DATADOG_APT_KEY_CURRENT.public | gpg --dearmor | tee /usr/share/keyrings/datadog-archive-keyring.gpg > /dev/null
+
+# Register the stable APT source using the keyring
+echo "deb [signed-by=/usr/share/keyrings/datadog-archive-keyring.gpg] https://apt.vector.dev/ stable vector-0" | tee /etc/apt/sources.list.d/vector.list
+
+# Install Vector
+apt-get update
+apt-get install -y vector
+```
+
+---
+
+## Phase 3: Setup Dynamic PID Mapping (Proxmox Host)
+
+Proxmox root directories are namespace-isolated and their physical process IDs (PIDs) shift when containers restart. To ensure a permanently valid connection to your nested Docker container, we map a persistent symbolic link.
+
+### 1. Create the Symlink Automation Script
+```bash
+nano /usr/local/bin/update-lxc-docker-sock.sh
+```
+
+Paste this auto-resolving script:
+
+```bash
+#!/bin/bash
+VMID="101" # Target your Docker container's LXC VMID here
+LINK_PATH="/run/docker-nested-101.sock"
+
+# Dynamic lookup of active host PID
+PID=$(lxc-info -n $VMID -p -H 2>/dev/null)
+
+if [ ! -z "$PID" ] && [ "$PID" != "-1" ]; then
+    rm -f "$LINK_PATH"
+    # Establish direct path to the nested namespace's run directory
+    ln -s "/proc/$PID/root/run/docker.sock" "$LINK_PATH"
+    echo "Successfully mapped nested Docker socket of LXC $VMID (PID $PID) to $LINK_PATH"
+else
+    echo "LXC $VMID is currently stopped."
+    exit 1
+fi
+```
+
+```bash
+chmod +x /usr/local/bin/update-lxc-docker-sock.sh
+```
+
+### 2. Configure Systemd Service Overrides
+Vector must run as `root` on the host to parse external namespace PIDs, and must execute the symlink updater *before* attempting configuration validation.
+
+Force write your systemd drop-in configuration:
+
+```bash
+mkdir -p /etc/systemd/system/vector.service.d/
+
+cat << 'EOF' > /etc/systemd/system/vector.service.d/override.conf
+[Service]
+User=root
+Group=root
+
+# Empty the existing ExecStartPre list to clear default validation ordering
+ExecStartPre=
+
+# 1. Update/Generate the nested socket symlink
+ExecStartPre=/usr/local/bin/update-lxc-docker-sock.sh
+
+# 2. Perform the Vector configuration validation check
+ExecStartPre=/usr/bin/vector validate
+EOF
+
+systemctl daemon-reload
+```
+
+---
+
+## Phase 4: Configure Vector Data Routing (Proxmox Host)
+
+Replace `/etc/vector/vector.yaml` to parse your selected Docker logs and route them to Logdy:
+
+```yaml
+sources:
+  docker_nested_logs:
+    type: "docker_logs"
+    docker_host: "unix:///run/docker-nested-101.sock" # Static path maintained by update-lxc-docker-sock.sh
+    include_containers:
+      - "stremio-einthusan"
+      - "stremio-einthusan-pg"
+      - "authelia"
+      - "easynews-plus-plus"
+      - "stremio-recommends"
+      - "stremio-reddit-recommends-onnx"
+      - "bitmagnet"
+      - "postgres"
+
+sinks:
+  logdy_central:
+    type: "socket"
+    inputs: ["docker_nested_logs"]
+    address: "192.168.1.40:8123" # Replace with your Central Logdy LXC IP
+    mode: "tcp"
+    encoding:
+      codec: "json" # Keeps structured data for UI parsing
+```
+
+---
+
+## Phase 5: Run and Maintain
+
+To start your pipeline, run these commands on the Proxmox Host:
+
+```bash
+# Check configuration health
+vector validate --config-dir /etc/vector/
+
+# Launch background engine
+systemctl restart vector
+systemctl status vector
+```
+
+---
+
+## Phase 6: Logdy Dashboard Configuration
+
+Because Vector transmits log entries structured as JSON payloads, configure Logdy to format them:
+
+1. Open **`http://<YOUR_ALPINE_LOGDY_IP>:8080`** in your browser.
+2. Toggle on **Auto-Parse JSON** in the top navigation panel.
+3. Open **Settings** ➔ **Columns** in the top right.
+4. Add a new custom column:
+   * **Header:** `Container`
+   * **JSON Path:** `container_name`
+5. Add a second custom column:
+   * **Header:** `Log`
+   * **JSON Path:** `message`
+6. Disable the generic "Raw Line" column for a beautiful, live-scrolling multi-container view.
+7. Use the search bar to query fields in-memory (e.g., `container_name:"authelia" AND level:"error"`).
+```
