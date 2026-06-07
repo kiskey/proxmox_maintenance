@@ -1,70 +1,91 @@
 # Agentless Real-Time Centralized Log Infrastructure (Logdy + Vector)
 
-A production-grade, ultra-thin, and **100% in-memory (zero disk-write amplification)** log-centralization system. This architecture runs completely in RAM to protect SSD longevity on Proxmox hypervisors while providing real-time, sub-millisecond dashboard filtering.
+A highly optimized, enterprise-grade, **100% in-memory (zero disk-write amplification)** logging pipeline. This architecture aggregates logs from nested Docker containers and standalone application log files inside LXCs without requiring agents, sidecars, or custom scripts within the containers themselves.
 
 ---
 
-# System Architecture
+# Architecture Overview
 
 ```text
                                   [ PROXMOX HOST ]
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                                                                              │
-│  [ LXC 101: Docker Host ]              [ Host-Level Logging Router ]         │
-│  ┌───────────────────────┐             ┌─────────────────────────────┐       │
-│  │  - Authelia           │             │  Vector (Rust Engine)       │       │
-│  │  - Postgres           │             │                             │       │
-│  │  - Stremio Add-ons    │             │  1. Scrapes nested socket   │       │
-│  │                       │             │     via /proc namespace     │       │
-│  │  /run/docker.sock ───┼────────────►│  2. Routes structured JSON  │       │
-│  └───────────────────────┘             └──────────────┬──────────────┘       │
-│                                                       │ (Port 8123 TCP)      │
-└───────────────────────────────────────────────────────┼──────────────────────┘
-                                                        ▼
-                                           [ CENTRAL LOGDY SERVER ]
-                                         ┌───────────────────────────┐
-                                         │  Alpine LXC (RAM Buffers) │
-                                         │  Web UI Port: 8080        │
-                                         └───────────────────────────┘
+│  [ LXC 101: Docker ]        [ LXC 102: App ]      [ Master Symlink Mapper ]  │
+│  ┌──────────────────┐       ┌──────────────┐      ┌───────────────────────┐  │
+│  │ Authelia, etc.   │       │ myapp/       │      │ update-lxc-symlinks.sh│  │
+│  │ /run/docker.sock │       │ error.log    │      └───────────┬───────────┘  │
+│  └────────┬─────────┘       └──────┬───────┘                  │              │
+│           │                        │                          │ Resolves     │
+│           ▼                        ▼                          │ Active PIDs  │
+│     /run/docker-nested-101.sock  /run/lxc-102-myapp-error.log │              │
+│     (or /dev/null if offline)    (or /dev/null if offline)    ▼              │
+│           │                        │                                         │
+│           └──────────────┬─────────┘                                         │
+│                          ▼                                                   │
+│                 [ Vector Host Daemon ]                                       │
+│                          │                                                   │
+│                          ▼                                                   │
+│                     TCP 8123                                                 │
+└──────────────────────────┼───────────────────────────────────────────────────┘
+                           ▼
+                [ Central Logdy Server ]
+              ┌───────────────────────────┐
+              │  Alpine LXC (RAM Buffers) │
+              │  Web UI Port: 8080        │
+              └───────────────────────────┘
 ```
 
-## Components
+---
 
-### Central Receiver
+# Design Principles
 
-Logdy running in `socket` mode inside a lightweight Alpine Linux LXC.
+## RAM-Resident Logging
 
-- Stores active log buffers entirely in RAM.
-- Provides real-time web dashboard access.
-- Eliminates database requirements.
-- Avoids disk-write amplification.
+Logdy stores active log buffers entirely in memory using a Go-based ring buffer.
 
-### Log Shipper
+Benefits:
 
-Vector running directly on the Proxmox host as a root service.
+- No database dependency
+- No local log storage
+- Minimal SSD wear
+- Fast in-memory filtering
 
-- Maps the namespace of nested LXC containers.
-- Auto-discovers selected Docker containers.
-- Streams structured logs via TCP.
-- Requires no agents inside application containers.
+## Agentless Collection
+
+Vector runs on the Proxmox host and accesses container resources through:
+
+```text
+/proc/<PID>/root
+```
+
+This avoids:
+
+- Container modifications
+- Sidecar containers
+- Additional log agents
+
+## Offline Container Resiliency
+
+If an LXC is offline during boot or service startup:
+
+- The mapping script automatically redirects the host-side path to `/dev/null`
+- `vector validate` succeeds
+- Vector starts normally
+- No boot-order dependency failures occur
 
 ---
 
 # Phase 1: Setup Logdy Central Receiver (Alpine LXC)
 
-Logdy serves as the central high-performance ring buffer.
+Logdy receives logs on TCP port `8123` and serves the web dashboard on port `8080`.
 
-Because Alpine uses `musl` instead of `glibc`, install compatibility layers before running Logdy.
+---
 
-## 1. Install Compatibility Layer & Logdy
+## 1. Install Alpine Compatibility Layer
 
-Download your preferred Logdy release and place it at:
+Logdy binaries are typically linked against `glibc`.
 
-```text
-/usr/local/bin/logdy
-```
-
-Install compatibility packages:
+Since Alpine uses `musl`, install compatibility support:
 
 ```bash
 apk update
@@ -93,9 +114,8 @@ description="Logdy Real-time Centralized Log Server"
 
 command="/usr/local/bin/logdy"
 
-# Opens:
-# - TCP 8123 for Vector ingestion
-# - TCP 8080 for browser UI
+# Listen for Vector on TCP 8123
+# Serve Web UI on TCP 8080
 command_args="socket 8123 --port 8080 --ui-ip 0.0.0.0 --no-analytics --no-updates"
 
 command_background="yes"
@@ -122,33 +142,33 @@ rc-update add logdy default
 rc-service logdy start
 ```
 
-Verify access:
+Verify:
 
 ```text
-http://<YOUR_ALPINE_LOGDY_IP>:8080
+http://<LOGDY_LXC_IP>:8080
 ```
 
 ---
 
 # Phase 2: Install Vector on the Proxmox Host
 
-Run Vector directly on the Proxmox host so a single service can aggregate logs from any Docker-enabled LXC.
+Vector acts as the centralized log router.
 
 ---
 
-## 1. Register the Official Repository
+## 1. Configure Official Repository
 
 ```bash
 # Install prerequisites
 apt-get update
 apt-get install -y apt-transport-https curl gnupg
 
-# Download Datadog GPG key
+# Import Datadog GPG key
 curl -sSf https://keys.datadoghq.com/DATADOG_APT_KEY_CURRENT.public \
   | gpg --dearmor \
   | tee /usr/share/keyrings/datadog-archive-keyring.gpg >/dev/null
 
-# Register Vector repository
+# Register repository
 echo "deb [signed-by=/usr/share/keyrings/datadog-archive-keyring.gpg] https://apt.vector.dev/ stable vector-0" \
   | tee /etc/apt/sources.list.d/vector.list
 
@@ -159,18 +179,20 @@ apt-get install -y vector
 
 ---
 
-# Phase 3: Dynamic PID Mapping for Nested Docker
+# Phase 3: Dynamic PID Mapping
 
-Container host PIDs change whenever an LXC restarts.
+Create a single self-healing mapping service that dynamically exposes files and sockets from LXCs.
 
-To maintain a stable Docker socket path for Vector, create a dynamic symlink.
+Adding future mappings only requires another entry in the `MAP` array.
 
 ---
 
-## 1. Create the Socket Mapping Script
+## 1. Create Master Symlink Mapper
+
+Create:
 
 ```bash
-nano /usr/local/bin/update-lxc-docker-sock.sh
+nano /usr/local/bin/update-lxc-symlinks.sh
 ```
 
 Paste:
@@ -178,29 +200,48 @@ Paste:
 ```bash
 #!/bin/bash
 
-VMID="101"
-LINK_PATH="/run/docker-nested-101.sock"
+# ============================================================================
+# MASTER LXC SYMLINK MAPPER
+# ============================================================================
+# Format:
+# VMID:SOURCE_PATH_INSIDE_CONTAINER:PERSISTENT_HOST_LINK
+# ============================================================================
 
-# Retrieve active host PID of the LXC
-PID=$(lxc-info -n $VMID -p -H 2>/dev/null)
+MAP=(
+  "101:/run/docker.sock:/run/docker-nested-101.sock"
+  "102:/var/log/myapp/error.log:/run/lxc-102-myapp-error.log"
+)
 
-if [ ! -z "$PID" ] && [ "$PID" != "-1" ]; then
-    rm -f "$LINK_PATH"
+echo "Initializing dynamic LXC mappings..."
 
-    # Link directly into the LXC namespace
-    ln -s "/proc/$PID/root/run/docker.sock" "$LINK_PATH"
+for ENTRY in "${MAP[@]}"; do
+    IFS=":" read -r VMID SOURCE_PATH TARGET_LINK <<< "$ENTRY"
 
-    echo "Successfully mapped nested Docker socket of LXC $VMID (PID $PID) to $LINK_PATH"
-else
-    echo "LXC $VMID is currently stopped."
-    exit 1
-fi
+    PID=$(lxc-info -n "$VMID" -p -H 2>/dev/null)
+
+    # Remove stale mapping
+    rm -f "$TARGET_LINK"
+
+    if [ ! -z "$PID" ] && [ "$PID" != "-1" ]; then
+
+        ln -s "/proc/$PID/root$SOURCE_PATH" "$TARGET_LINK"
+
+        echo "[ACTIVE] LXC $VMID -> $SOURCE_PATH -> $TARGET_LINK"
+
+    else
+
+        ln -s "/dev/null" "$TARGET_LINK"
+
+        echo "[OFFLINE] LXC $VMID -> $TARGET_LINK -> /dev/null"
+
+    fi
+done
 ```
 
 Make executable:
 
 ```bash
-chmod +x /usr/local/bin/update-lxc-docker-sock.sh
+chmod +x /usr/local/bin/update-lxc-symlinks.sh
 ```
 
 ---
@@ -213,7 +254,7 @@ Create the override directory:
 mkdir -p /etc/systemd/system/vector.service.d/
 ```
 
-Create the override:
+Create:
 
 ```bash
 cat << 'EOF' > /etc/systemd/system/vector.service.d/override.conf
@@ -221,13 +262,13 @@ cat << 'EOF' > /etc/systemd/system/vector.service.d/override.conf
 User=root
 Group=root
 
-# Clear existing validation ordering
+# Clear vendor-defined pre-start actions
 ExecStartPre=
 
-# Update nested Docker socket symlink
-ExecStartPre=/usr/local/bin/update-lxc-docker-sock.sh
+# Step 1: Build namespace mappings
+ExecStartPre=/usr/local/bin/update-lxc-symlinks.sh
 
-# Validate Vector configuration
+# Step 2: Validate Vector configuration
 ExecStartPre=/usr/bin/vector validate
 EOF
 ```
@@ -252,6 +293,8 @@ with:
 
 ```yaml
 sources:
+
+  # Docker logs from LXC 101
   docker_nested_logs:
     type: docker_logs
     docker_host: "unix:///run/docker-nested-101.sock"
@@ -266,12 +309,23 @@ sources:
       - "bitmagnet"
       - "postgres"
 
+  # Application logs from LXC 102
+  lxc_102_app_logs:
+    type: file
+
+    include:
+      - "/run/lxc-102-myapp-error.log"
+
+    read_from: end
+
 sinks:
+
   logdy_central:
     type: socket
 
     inputs:
       - docker_nested_logs
+      - lxc_102_app_logs
 
     address: "192.168.1.40:8123"
     mode: tcp
@@ -282,34 +336,33 @@ sinks:
 
 ### Notes
 
-- `docker_host` points to the dynamically maintained socket symlink.
-- `include_containers` limits collection to selected containers.
-- `codec: json` preserves structured fields for Logdy parsing.
 - Replace `192.168.1.40` with your Logdy server IP.
+- Docker and file sources are merged into a single output stream.
+- JSON encoding preserves metadata for dashboard filtering.
 
 ---
 
-# Phase 5: Start and Validate
+# Phase 5: Validation and Operations
 
-Validate configuration:
+## Validate Configuration
 
 ```bash
 vector validate --config-dir /etc/vector/
 ```
 
-Restart Vector:
+## Restart Vector
 
 ```bash
 systemctl restart vector
 ```
 
-Check service status:
+## Check Status
 
 ```bash
 systemctl status vector
 ```
 
-Follow logs:
+## View Live Logs
 
 ```bash
 journalctl -u vector -f
@@ -317,97 +370,106 @@ journalctl -u vector -f
 
 ---
 
-# Phase 6: Configure the Logdy Dashboard
+# Phase 6: Configure Logdy Dashboard
 
-Since Vector sends JSON payloads, configure Logdy to display structured fields.
+Open:
 
-## Dashboard Setup
+```text
+http://<LOGDY_LXC_IP>:8080
+```
 
-1. Open:
+---
 
-   ```text
-   http://<YOUR_ALPINE_LOGDY_IP>:8080
-   ```
+## Enable JSON Parsing
 
-2. Enable **Auto-Parse JSON**.
-
-3. Open:
+1. Enable **Auto-Parse JSON**.
+2. Open:
 
    ```text
    Settings → Columns
    ```
 
-4. Add a custom column:
+---
 
-   | Field      | Value            |
-   |------------|------------------|
-   | Header     | Container        |
-   | JSON Path  | container_name   |
+## Recommended Columns
 
-5. Add another custom column:
+### Container / File
 
-   | Field      | Value    |
-   |------------|----------|
-   | Header     | Log      |
-   | JSON Path  | message  |
+| Setting | Value |
+|----------|----------|
+| Header | Container / File |
+| JSON Path | `container_name` or `file` |
 
-6. Disable the default **Raw Line** column.
+### Message
 
-7. Use structured filtering:
+| Setting | Value |
+|----------|----------|
+| Header | Log Message |
+| JSON Path | `message` |
 
-   ```text
-   container_name:"authelia"
-   ```
+Disable the default **Raw Line** column for a cleaner interface.
 
-   or
+---
 
-   ```text
-   container_name:"authelia" AND level:"error"
-   ```
+## Example Searches
+
+Filter Docker container errors:
+
+```text
+container_name:"authelia" AND level:"error"
+```
+
+Filter a specific application log:
+
+```text
+file:"/var/log/myapp/error.log"
+```
+
+Search all error messages:
+
+```text
+level:"error"
+```
 
 ---
 
 # Operational Commands
 
-## Logdy
+## Refresh Namespace Mappings
 
 ```bash
-rc-service logdy start
-rc-service logdy stop
-rc-service logdy restart
-rc-service logdy status
+/usr/local/bin/update-lxc-symlinks.sh
 ```
 
-## Vector
+## Validate Configuration
 
 ```bash
-systemctl start vector
-systemctl stop vector
+vector validate --config-dir /etc/vector/
+```
+
+## Restart Vector
+
+```bash
 systemctl restart vector
-systemctl status vector
 ```
 
-## Live Logs
+## Restart Logdy
 
 ```bash
-journalctl -u vector -f
-```
-
-```bash
-tail -f /var/log/logdy.log
+rc-service logdy restart
 ```
 
 ---
 
-# Design Goals
+# Benefits
 
 - Agentless log collection
-- Zero application changes
-- RAM-only active buffering
-- No database dependency
+- Works with Docker and non-Docker LXCs
+- Zero database dependency
+- RAM-only active storage
 - Minimal SSD wear
-- Lightweight Alpine deployment
-- Single centralized dashboard
-- Structured JSON log search
-- Automatic recovery after container restarts
-- Suitable for Proxmox + Docker nested LXC environments
+- Automatic PID remapping after container restarts
+- Boot-safe offline container handling
+- Centralized real-time dashboard
+- Structured JSON filtering and search
+- Easily extensible through the `MAP` array
